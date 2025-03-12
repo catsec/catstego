@@ -1,0 +1,23 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build catstego",
+            "type": "shell",
+            "command": "make",
+            "args": [],
+            "options": {
+                "env": {
+                    /* Point to Homebrew’s OpenSSL include and lib directories if necessary */
+                    "CFLAGS": "-I/opt/homebrew/opt/openssl/include",
+                    "LDFLAGS": "-L/opt/homebrew/opt/openssl/lib"
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        }
+    ]
+}
