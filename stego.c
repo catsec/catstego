@@ -1,24 +1,34 @@
-#include "stego.h"
-#include "fileio.h"
+/* stego.c – Library functions for embedding/extracting a stego payload in JPEG data.
+   This file has no dependencies other than jpeglib and standard C libraries.
+   It performs only the JPEG embedding and extracting.
+   Encryption, password/key derivation, file reading, and user argument parsing are done in catstego.c.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
+#include <stdint.h>
+#include <math.h>
 #include <jpeglib.h>
 #include <jerror.h>
-#include <math.h>
+#include "stego.h"
 
-#define HEADER_SIZE 36  // 4-byte ciphertext bit-length, 16-byte IV, 16-byte salt
+#define HEADER_SIZE 36  // 4-byte payload bit-length, 16-byte IV, 16-byte salt
 
-/* Candidate selection: a DCT coefficient is a candidate if (abs(coefficient) & 0x7C) > 0 */
+/* --- Helper Functions --- */
+
+/* is_candidate:
+   Returns true if a DCT coefficient is suitable for embedding (based on (abs(coefficient) & 0x7C)).
+*/
 static inline int is_candidate(int coeff) {
     return ((abs(coeff) & 0x7C) > 0);
 }
 
-/* embed_bit: embed a single bit into a coefficient by modifying its LSB.
-   If the new value does not satisfy the candidate condition, a safe default is used.
+/* embed_bit:
+   Embeds a single bit into a coefficient's least-significant bit.
+   If the modified coefficient would not satisfy the candidate condition, a safe default is used.
 */
-int embed_bit(int coeff, int bit) {
+static int embed_bit(int coeff, int bit) {
     int sign = (coeff < 0) ? -1 : 1;
     int abs_val = abs(coeff);
     int new_abs = (abs_val & ~1) | bit;
@@ -28,13 +38,15 @@ int embed_bit(int coeff, int bit) {
     return sign * new_abs;
 }
 
-/* bytes_to_bits: converts an array of bytes to an array of bits (MSB first) */
-void bytes_to_bits(const uint8_t *data, int data_len, uint8_t **bits, int *bits_len) {
+/* bytes_to_bits:
+   Converts an array of bytes to an array of bits (MSB first).
+*/
+static void bytes_to_bits(const uint8_t *data, int data_len, uint8_t **bits, int *bits_len) {
     int total = data_len * 8;
     *bits = malloc(total);
-    if (!*bits) { 
-        *bits_len = 0; 
-        return; 
+    if (!*bits) {
+        *bits_len = 0;
+        return;
     }
     for (int i = 0; i < data_len; i++) {
         for (int j = 0; j < 8; j++) {
@@ -44,13 +56,15 @@ void bytes_to_bits(const uint8_t *data, int data_len, uint8_t **bits, int *bits_
     *bits_len = total;
 }
 
-/* bits_to_bytes: converts an array of bits (MSB first) back to bytes */
-void bits_to_bytes(const uint8_t *bits, int bits_len, uint8_t **data, int *data_len) {
+/* bits_to_bytes:
+   Converts an array of bits (MSB first) back to bytes.
+*/
+static void bits_to_bytes(const uint8_t *bits, int bits_len, uint8_t **data, int *data_len) {
     int len = bits_len / 8;
     *data = malloc(len);
-    if (!*data) { 
-        *data_len = 0; 
-        return; 
+    if (!*data) {
+        *data_len = 0;
+        return;
     }
     for (int i = 0; i < len; i++) {
         uint8_t byte = 0;
@@ -63,8 +77,7 @@ void bits_to_bytes(const uint8_t *bits, int bits_len, uint8_t **data, int *data_
 }
 
 /* final_candidate_count:
-   Starting from candidate_count, decrement until the count is not divisible by 251.
-   This ensures that 251 is coprime with the final candidate count.
+   Decrements candidate_count until it is not divisible by 251. This guarantees 251 is coprime with the final count.
 */
 static int final_candidate_count(int candidate_count) {
     int final_count = candidate_count;
@@ -74,81 +87,83 @@ static int final_candidate_count(int candidate_count) {
     return final_count;
 }
 
+/* --- Library Functions --- */
+
 /*
- * embed_stego_payload_in_jpeg:
- *   - Builds stego_payload = header || ciphertext, where the header (36 bytes) is:
- *         Bytes 0–3: (ciphertext_len * 8) in little-endian,
- *         Bytes 4–19: IV,
- *         Bytes 20–35: salt.
- *   - Converts the payload to a bit stream.
- *   - Builds a candidate list from all DCT coefficients satisfying is_candidate().
- *   - Computes final_count = final_candidate_count(candidate_count) and checks capacity.
- *   - Embeds each payload bit at candidate index:
- *         pos = (j * 251) mod final_count
- *   - Writes out the modified JPEG.
+ * embed_payload_in_jpeg_memory:
+ *   Inputs:
+ *     payload       : pointer to the already–encrypted payload (ciphertext)
+ *     payload_len   : length (in bytes) of the payload
+ *     iv            : pointer to a 16-byte IV
+ *     salt          : pointer to a 16-byte salt
+ *     jpeg_in_data  : pointer to JPEG file data in memory
+ *     jpeg_in_size  : size (in bytes) of the JPEG data
+ *     error         : caller‑provided buffer for error messages (UTF‑8)
+ *     error_buf_size: size of the error buffer
+ *   Outputs:
+ *     jpeg_out_data : pointer (allocated within) to the modified JPEG data with the embedded payload
+ *     jpeg_out_size : size (in bytes) of the modified JPEG data
+ *   Returns 0 on success, -1 on error.
  */
-int embed_stego_payload_in_jpeg(const char *jpeg_in_path,
-                                  const uint8_t *ciphertext,
-                                  int ciphertext_len,
-                                  const uint8_t *iv,
-                                  const uint8_t *salt,
-                                  const char *jpeg_out_path) {
-    int stego_payload_len = HEADER_SIZE + ciphertext_len;
+int embed_payload_in_jpeg_memory(const uint8_t *payload, int payload_len,
+                                   const uint8_t *iv, const uint8_t *salt,
+                                   const uint8_t *jpeg_in_data, long jpeg_in_size,
+                                   uint8_t **jpeg_out_data, long *jpeg_out_size,
+                                   char *error, int error_buf_size)
+{
+    /* Build stego_payload = header || payload.
+       The header consists of:
+         - 4 bytes: payload bit-length (little-endian)
+         - 16 bytes: IV
+         - 16 bytes: salt
+    */
+    int stego_payload_len = HEADER_SIZE + payload_len;
     uint8_t *stego_payload = malloc(stego_payload_len);
     if (!stego_payload) {
-        fprintf(stderr, "Error: Unable to allocate stego payload.\n");
+        if (error) snprintf(error, error_buf_size, "Memory allocation for stego payload failed.");
         return -1;
     }
-    uint32_t payload_bit_length = ciphertext_len * 8;
+    uint32_t payload_bit_length = payload_len * 8;
     stego_payload[0] = payload_bit_length & 0xFF;
     stego_payload[1] = (payload_bit_length >> 8) & 0xFF;
     stego_payload[2] = (payload_bit_length >> 16) & 0xFF;
     stego_payload[3] = (payload_bit_length >> 24) & 0xFF;
     memcpy(stego_payload + 4, iv, 16);
     memcpy(stego_payload + 20, salt, 16);
-    memcpy(stego_payload + HEADER_SIZE, ciphertext, ciphertext_len);
+    memcpy(stego_payload + HEADER_SIZE, payload, payload_len);
     
+    /* Convert the full stego_payload into a bit stream */
     uint8_t *payload_bits = NULL;
     int payload_bits_len = 0;
     bytes_to_bits(stego_payload, stego_payload_len, &payload_bits, &payload_bits_len);
     free(stego_payload);
+    if (payload_bits_len == 0) {
+        if (error) snprintf(error, error_buf_size, "Conversion of stego payload to bits failed.");
+        return -1;
+    }
     
+    /* Decompress the JPEG from memory */
     struct jpeg_decompress_struct dinfo;
     struct jpeg_error_mgr jerr;
-    uint8_t *jpeg_in_data = NULL;
-    long jpeg_in_size = 0;
-    int ret = 0;
-    
-    if (read_file(jpeg_in_path, &jpeg_in_data, &jpeg_in_size) != 0) {
-        fprintf(stderr, "Error: Failed to read input JPEG file '%s'.\n", jpeg_in_path);
+    dinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&dinfo);
+    jpeg_mem_src(&dinfo, (unsigned char *)jpeg_in_data, jpeg_in_size);
+    if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) {
+        if (error) snprintf(error, error_buf_size, "Failed to read JPEG header.");
+        jpeg_destroy_decompress(&dinfo);
+        free(payload_bits);
+        return -1;
+    }
+    jvirt_barray_ptr *coef_arrays = jpeg_read_coefficients(&dinfo);
+    if (!coef_arrays) {
+        if (error) snprintf(error, error_buf_size, "Failed to read JPEG coefficients.");
+        jpeg_finish_decompress(&dinfo);
+        jpeg_destroy_decompress(&dinfo);
         free(payload_bits);
         return -1;
     }
     
-    dinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_decompress(&dinfo);
-    jpeg_mem_src(&dinfo, jpeg_in_data, jpeg_in_size);
-    if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) {
-        fprintf(stderr, "Error: Failed to read JPEG header from '%s'.\n", jpeg_in_path);
-        ret = -1;
-        jpeg_finish_decompress(&dinfo);
-        jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        free(payload_bits);
-        return ret;
-    }
-    
-    jvirt_barray_ptr *coef_arrays = jpeg_read_coefficients(&dinfo);
-    if (!coef_arrays) {
-        fprintf(stderr, "Error: Could not read coefficient arrays.\n");
-        ret = -1;
-        jpeg_finish_decompress(&dinfo);
-        jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        free(payload_bits);
-        return ret;
-    }
-    
+    /* Build candidate list from DCT coefficients */
     int candidate_count = 0;
     for (int comp = 0; comp < dinfo.num_components; comp++) {
         jpeg_component_info *comp_info = &dinfo.comp_info[comp];
@@ -166,26 +181,22 @@ int embed_stego_payload_in_jpeg(const char *jpeg_in_path,
             }
         }
     }
-    
     int final_count = final_candidate_count(candidate_count);
     if (final_count < payload_bits_len) {
-        fprintf(stderr, "Error: Not enough candidate coefficients (%d) to embed %d bits.\n", final_count, payload_bits_len);
-        ret = -1;
-        free(payload_bits);
+        if (error) snprintf(error, error_buf_size, "Not enough candidate coefficients (%d) to embed %d bits.", final_count, payload_bits_len);
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        free(payload_bits);
+        return -1;
     }
     
     JCOEF **candidates = malloc(candidate_count * sizeof(JCOEF *));
     if (!candidates) {
-        ret = -1;
-        free(payload_bits);
+        if (error) snprintf(error, error_buf_size, "Memory allocation for candidate list failed.");
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        free(payload_bits);
+        return -1;
     }
     int idx = 0;
     for (int comp = 0; comp < dinfo.num_components; comp++) {
@@ -205,92 +216,92 @@ int embed_stego_payload_in_jpeg(const char *jpeg_in_path,
         }
     }
     if (idx != candidate_count) {
-        fprintf(stderr, "Error: Candidate count mismatch: %d vs %d\n", candidate_count, idx);
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Candidate count mismatch: expected %d, got %d", candidate_count, idx);
         free(candidates);
         free(payload_bits);
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     
+    /* Embed each payload bit into the candidate coefficients */
     for (int j = 0; j < payload_bits_len; j++) {
         int pos = (j * 251) % final_count;
         *candidates[pos] = embed_bit(*candidates[pos], payload_bits[j]);
     }
     free(payload_bits);
     
-    {
-        struct jpeg_compress_struct cinfo;
-        struct jpeg_error_mgr cjerr;
-        cinfo.err = jpeg_std_error(&cjerr);
-        jpeg_create_compress(&cinfo);
-        unsigned char *outbuffer = NULL;
-        unsigned long outsize = 0;
-        jpeg_mem_dest(&cinfo, &outbuffer, &outsize);
-        jpeg_copy_critical_parameters(&dinfo, &cinfo);
-        jpeg_write_coefficients(&cinfo, coef_arrays);
-        jpeg_finish_compress(&cinfo);
-        jpeg_destroy_compress(&cinfo);
-        if (write_file(jpeg_out_path, outbuffer, outsize) != 0) {
-            fprintf(stderr, "Error: Failed to write output JPEG file '%s'.\n", jpeg_out_path);
-            ret = -1;
-        }
+    /* Compress the modified JPEG to memory */
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr cjerr;
+    cinfo.err = jpeg_std_error(&cjerr);
+    jpeg_create_compress(&cinfo);
+    unsigned char *outbuffer = NULL;
+    unsigned long outsize = 0;
+    jpeg_mem_dest(&cinfo, &outbuffer, &outsize);
+    jpeg_copy_critical_parameters(&dinfo, &cinfo);
+    jpeg_write_coefficients(&cinfo, coef_arrays);
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    
+    /* Set output data */
+    *jpeg_out_data = malloc(outsize);
+    if (!*jpeg_out_data) {
+        if (error) snprintf(error, error_buf_size, "Memory allocation for output JPEG failed.");
+        free(candidates);
+        jpeg_finish_decompress(&dinfo);
+        jpeg_destroy_decompress(&dinfo);
         free(outbuffer);
+        return -1;
     }
+    memcpy(*jpeg_out_data, outbuffer, outsize);
+    *jpeg_out_size = outsize;
+    free(outbuffer);
     
     jpeg_finish_decompress(&dinfo);
     jpeg_destroy_decompress(&dinfo);
     free(candidates);
-    free(jpeg_in_data);
-    return ret;
+    return 0;
 }
 
 /*
- * extract_stego_payload_from_jpeg:
- *   - Rebuild the candidate list using the same candidate test.
- *   - Compute final_count = final_candidate_count(candidate_count).
- *   - Recover the payload bits by reading:
- *         pos = (j * 251) mod final_count
- *     for j from 0 to total_payload_bits-1.
- *   - First, extract the first 32 bits (4 bytes) to get ciphertext bit-length.
- *   - Then, extract total_payload_bits = (HEADER_SIZE*8 + ciphertext_bit_length) bits.
- *   - Convert the recovered bit stream back to bytes.
+ * extract_payload_from_jpeg_memory:
+ *   Inputs:
+ *     jpeg_data    : pointer to JPEG file data in memory (with embedded payload)
+ *     jpeg_size    : size (in bytes) of the JPEG data
+ *     error        : caller‑provided buffer for error messages (UTF‑8)
+ *     error_buf_size: size of the error buffer
+ *   Outputs:
+ *     payload_out     : pointer (allocated within) to the extracted payload (still encrypted)
+ *     payload_out_len : length (in bytes) of the extracted payload
+ *     iv_out          : a 16-byte buffer (provided by the caller) where the extracted IV is stored
+ *     salt_out        : a 16-byte buffer (provided by the caller) where the extracted salt is stored
+ *   Returns 0 on success, -1 on error.
  */
-int extract_stego_payload_from_jpeg(const char *jpeg_in_path, uint8_t **payload_out, int *payload_out_len) {
+int extract_payload_from_jpeg_memory(const uint8_t *jpeg_data, long jpeg_size,
+                                      uint8_t **payload_out, int *payload_out_len,
+                                      uint8_t *iv_out, uint8_t *salt_out,
+                                      char *error, int error_buf_size)
+{
     struct jpeg_decompress_struct dinfo;
     struct jpeg_error_mgr jerr;
-    uint8_t *jpeg_in_data = NULL;
-    long jpeg_in_size = 0;
-    int ret = 0;
-    
-    if (read_file(jpeg_in_path, &jpeg_in_data, &jpeg_in_size) != 0) {
-        fprintf(stderr, "Error: Failed to read input JPEG file '%s'.\n", jpeg_in_path);
-        return -1;
-    }
-    
     dinfo.err = jpeg_std_error(&jerr);
     jpeg_create_decompress(&dinfo);
-    jpeg_mem_src(&dinfo, jpeg_in_data, jpeg_in_size);
+    jpeg_mem_src(&dinfo, (unsigned char *)jpeg_data, jpeg_size);
     if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) {
-        fprintf(stderr, "Error: Failed to read JPEG header from '%s'.\n", jpeg_in_path);
-        ret = -1;
-        jpeg_finish_decompress(&dinfo);
+        if (error) snprintf(error, error_buf_size, "Failed to read JPEG header.");
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     jvirt_barray_ptr *coef_arrays = jpeg_read_coefficients(&dinfo);
     if (!coef_arrays) {
-        fprintf(stderr, "Error: Could not read coefficient arrays.\n");
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Failed to read JPEG coefficients.");
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     
+    /* Build candidate list from DCT coefficients */
     int candidate_count = 0;
     for (int comp = 0; comp < dinfo.num_components; comp++) {
         jpeg_component_info *comp_info = &dinfo.comp_info[comp];
@@ -311,11 +322,10 @@ int extract_stego_payload_from_jpeg(const char *jpeg_in_path, uint8_t **payload_
     
     JCOEF **candidates = malloc(candidate_count * sizeof(JCOEF *));
     if (!candidates) {
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Memory allocation for candidate list failed.");
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     int idx = 0;
     for (int comp = 0; comp < dinfo.num_components; comp++) {
@@ -335,26 +345,24 @@ int extract_stego_payload_from_jpeg(const char *jpeg_in_path, uint8_t **payload_
         }
     }
     if (idx != candidate_count) {
-        fprintf(stderr, "Error: Candidate count mismatch in extraction: %d vs %d\n", candidate_count, idx);
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Candidate count mismatch in extraction: expected %d, got %d", candidate_count, idx);
         free(candidates);
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     
     int final_count = final_candidate_count(candidate_count);
     
+    /* Extract header bits (first 32 bits) */
     int header_bits_extracted = 32;
     uint8_t *header_bits_array = malloc(header_bits_extracted);
     if (!header_bits_array) {
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Memory allocation for header bits failed.");
         free(candidates);
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     for (int j = 0; j < header_bits_extracted; j++) {
         int pos = (j * 251) % final_count;
@@ -365,27 +373,25 @@ int extract_stego_payload_from_jpeg(const char *jpeg_in_path, uint8_t **payload_
     bits_to_bytes(header_bits_array, header_bits_extracted, &header_bytes, &header_bytes_len);
     free(header_bits_array);
     if (header_bytes_len != 4) {
-        fprintf(stderr, "Error: Header conversion failed. Expected 4 bytes, got %d bytes.\n", header_bytes_len);
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Header conversion failed. Expected 4 bytes, got %d bytes.", header_bytes_len);
         free(candidates);
-        free(jpeg_in_data);
+        jpeg_finish_decompress(&dinfo);
+        jpeg_destroy_decompress(&dinfo);
         free(header_bytes);
-        return ret;
+        return -1;
     }
     uint32_t payload_bit_length = header_bytes[0] |
         (header_bytes[1] << 8) | (header_bytes[2] << 16) | (header_bytes[3] << 24);
-    printf("Extraction Debug: Payload bit length (from header): %u\n", payload_bit_length);
     
     int total_payload_bits = (HEADER_SIZE * 8) + payload_bit_length;
     uint8_t *payload_bits_array = malloc(total_payload_bits);
     if (!payload_bits_array) {
-        ret = -1;
+        if (error) snprintf(error, error_buf_size, "Memory allocation for payload bits failed.");
         free(candidates);
         free(header_bytes);
         jpeg_finish_decompress(&dinfo);
         jpeg_destroy_decompress(&dinfo);
-        free(jpeg_in_data);
-        return ret;
+        return -1;
     }
     for (int j = 0; j < total_payload_bits; j++) {
         int pos = (j * 251) % final_count;
@@ -396,22 +402,39 @@ int extract_stego_payload_from_jpeg(const char *jpeg_in_path, uint8_t **payload_
     bits_to_bytes(payload_bits_array, total_payload_bits, &full_extracted, &full_extracted_len);
     free(payload_bits_array);
     
-    printf("Extraction Debug: Full extracted payload length: %d bytes\n", full_extracted_len);
-    int extracted_ciphertext_len = full_extracted_len - HEADER_SIZE;
-    if (extracted_ciphertext_len != (int)(payload_bit_length / 8)) {
-        fprintf(stderr, "Warning: Encrypted payload length (%d bytes) does not match header expectation (%d bytes).\n",
-                extracted_ciphertext_len, payload_bit_length / 8);
-        full_extracted_len = HEADER_SIZE + (payload_bit_length / 8);
+    if (full_extracted_len < HEADER_SIZE) {
+        if (error) snprintf(error, error_buf_size, "Extracted data too short.");
+        free(candidates);
+        free(header_bytes);
+        free(full_extracted);
+        jpeg_finish_decompress(&dinfo);
+        jpeg_destroy_decompress(&dinfo);
+        return -1;
     }
     
-    *payload_out = full_extracted;
-    *payload_out_len = full_extracted_len;
+    /* Extract IV and salt from header */
+    memcpy(iv_out, full_extracted + 4, 16);
+    memcpy(salt_out, full_extracted + 20, 16);
+    
+    int extracted_payload_len = full_extracted_len - HEADER_SIZE;
+    uint8_t *payload_data = malloc(extracted_payload_len);
+    if (!payload_data) {
+        if (error) snprintf(error, error_buf_size, "Memory allocation for payload output failed.");
+        free(candidates);
+        free(header_bytes);
+        free(full_extracted);
+        jpeg_finish_decompress(&dinfo);
+        jpeg_destroy_decompress(&dinfo);
+        return -1;
+    }
+    memcpy(payload_data, full_extracted + HEADER_SIZE, extracted_payload_len);
+    free(full_extracted);
+    free(header_bytes);
+    *payload_out = payload_data;
+    *payload_out_len = extracted_payload_len;
     
     free(candidates);
-    free(header_bytes);
-    
     jpeg_finish_decompress(&dinfo);
     jpeg_destroy_decompress(&dinfo);
-    free(jpeg_in_data);
-    return ret;
+    return 0;
 }

@@ -9,8 +9,6 @@
 #include "fileio.h"
 #include "stego.h"
 
-
-
 #define HEADER_SIZE (4 + 16 + 16)  // 4-byte payload bit-length, IV, and salt
 
 /* Function to print usage information */
@@ -88,10 +86,11 @@ int main(int argc, char **argv) {
 }
 
 /* encode_mode:
- * - Reads the cover JPEG.
+ * - Reads the cover JPEG file into memory.
  * - Determines if secret_arg is a file or literal text.
- * - Encrypts the payload (with a header that includes ciphertext bit-length, IV, and salt).
- * - Embeds the payload into the JPEG.
+ * - Encrypts the payload (adding a header with ciphertext bit-length, IV, and salt).
+ * - Calls embed_payload_in_jpeg_memory() to embed the encrypted payload into the JPEG data.
+ * - Writes the modified JPEG to output_path.
  * - Optionally deletes the original cover image.
  */
 int encode_mode(const char *cover_path, const char *secret_arg, const char *password, const char *output_path, int delete_flag) {
@@ -147,15 +146,34 @@ int encode_mode(const char *cover_path, const char *secret_arg, const char *pass
     }
     free(payload_string);
 
-    /* Call the new embed function:
-       Pass the encrypted payload (ciphertext), its length, plus the IV and salt.
-    */
-    ret = embed_stego_payload_in_jpeg(cover_path, encrypted, encrypted_len, iv, salt, output_path);
-    free(encrypted);
-    if (ret != 0) {
-        fprintf(stderr, "Error: Failed to embed stego payload into JPEG.\n");
+    /* Read cover JPEG file into memory */
+    uint8_t *cover_data = NULL;
+    long cover_size = 0;
+    if (read_file(cover_path, &cover_data, &cover_size) != 0) {
+        fprintf(stderr, "Error: Failed to read cover image file '%s'.\n", cover_path);
+        free(encrypted);
         return -1;
     }
+
+    /* Embed the encrypted payload into the JPEG data */
+    uint8_t *jpeg_out_data = NULL;
+    long jpeg_out_size = 0;
+    char error_buffer[256] = {0};
+    ret = embed_payload_in_jpeg_memory(encrypted, encrypted_len, iv, salt, cover_data, cover_size,
+                                         &jpeg_out_data, &jpeg_out_size, error_buffer, sizeof(error_buffer));
+    free(cover_data);
+    free(encrypted);
+    if (ret != 0) {
+        fprintf(stderr, "Error: Failed to embed stego payload into JPEG: %s\n", error_buffer);
+        return -1;
+    }
+
+    if (write_file(output_path, jpeg_out_data, jpeg_out_size) != 0) {
+        fprintf(stderr, "Error: Failed to write output JPEG file '%s'.\n", output_path);
+        free(jpeg_out_data);
+        return -1;
+    }
+    free(jpeg_out_data);
 
     printf("Data encoded successfully into '%s'.\n", output_path);
     if (delete_flag) {
@@ -168,50 +186,47 @@ int encode_mode(const char *cover_path, const char *secret_arg, const char *pass
 }
 
 /* decode_mode:
- * - Reads the stego JPEG.
- * - Extracts the payload from the DCT coefficients.
- * - Parses the header to retrieve ciphertext bit-length, IV, and salt.
+ * - Reads the stego JPEG file into memory.
+ * - Extracts the encrypted payload, IV, and salt via extract_payload_from_jpeg_memory().
  * - Derives the key and decrypts the payload.
- * - If the payload starts with '/', it is treated as text; otherwise, it's assumed to include a filename.
+ * - If the decrypted payload starts with '/', it is treated as secret text; otherwise, it is assumed to contain a filename.
+ * - Writes the secret text or secret file to output_path (if provided) or prints the secret text.
  */
 int decode_mode(const char *stego_path, const char *password, const char *output_path) {
-    uint8_t *stego_payload = NULL;
-    int stego_payload_len = 0;
-    if (extract_stego_payload_from_jpeg(stego_path, &stego_payload, &stego_payload_len) != 0) {
-        fprintf(stderr, "Error: Failed to extract stego payload from JPEG '%s'.\n", stego_path);
-        return -1;
-    }
-    if (stego_payload_len < HEADER_SIZE) {
-        fprintf(stderr, "Error: Stego payload too short.\n");
-        free(stego_payload);
+    uint8_t *stego_data = NULL;
+    long stego_size = 0;
+    if (read_file(stego_path, &stego_data, &stego_size) != 0) {
+        fprintf(stderr, "Error: Failed to read stego JPEG file '%s'.\n", stego_path);
         return -1;
     }
 
-    uint32_t payload_bit_length = stego_payload[0] | (stego_payload[1] << 8) | (stego_payload[2] << 16) | (stego_payload[3] << 24);
-    int expected_encrypted_len = payload_bit_length / 8;
-    uint8_t iv[IV_LEN], salt[SALT_LEN];
-    memcpy(iv, stego_payload + 4, IV_LEN);
-    memcpy(salt, stego_payload + 4 + IV_LEN, SALT_LEN);
-    uint8_t *encrypted = stego_payload + HEADER_SIZE;
-    int encrypted_len = stego_payload_len - HEADER_SIZE;
-    if (encrypted_len != expected_encrypted_len)
-        fprintf(stderr, "Warning: Encrypted payload length (%d bytes) does not match header expectation (%d bytes).\n", encrypted_len, expected_encrypted_len);
+    uint8_t *extracted_encrypted = NULL;
+    int extracted_encrypted_len = 0;
+    uint8_t extracted_iv[IV_LEN], extracted_salt[SALT_LEN];
+    char error_buffer[256] = {0};
+    if (extract_payload_from_jpeg_memory(stego_data, stego_size, &extracted_encrypted, &extracted_encrypted_len,
+                                          extracted_iv, extracted_salt, error_buffer, sizeof(error_buffer)) != 0) {
+        fprintf(stderr, "Error: Failed to extract stego payload from JPEG: %s\n", error_buffer);
+        free(stego_data);
+        return -1;
+    }
+    free(stego_data);
 
     uint8_t key[KEY_LEN];
-    if (derive_key(password, salt, key) != 0) {
+    if (derive_key(password, extracted_salt, key) != 0) {
         fprintf(stderr, "Error: Key derivation failed.\n");
-        free(stego_payload);
+        free(extracted_encrypted);
         return -1;
     }
 
     uint8_t *decrypted = NULL;
     int decrypted_len = 0;
-    if (decrypt_data(encrypted, encrypted_len, key, iv, &decrypted, &decrypted_len) != 0) {
+    if (decrypt_data(extracted_encrypted, extracted_encrypted_len, key, extracted_iv, &decrypted, &decrypted_len) != 0) {
         fprintf(stderr, "Error: Decryption failed.\n");
-        free(stego_payload);
+        free(extracted_encrypted);
         return -1;
     }
-    free(stego_payload);
+    free(extracted_encrypted);
 
     if (decrypted_len < 1) {
         fprintf(stderr, "Error: Decrypted data is empty.\n");
